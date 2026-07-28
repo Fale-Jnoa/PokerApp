@@ -1,0 +1,13 @@
+# Render blueprint for the Socket.io backend.
+# Deploy the /server folder as a Node web service.
+services:
+  - type: web
+    name: poker-chip-tracker-server
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: CLIENT_ORIGIN
+        sync: false # set to your Vercel URL, e.g. https://your-app.vercel.app
