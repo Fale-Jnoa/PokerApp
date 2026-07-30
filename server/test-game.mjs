@@ -2,8 +2,9 @@
 import {
   createRoom, addPlayer, removePlayer, startHand, applyAction, awardPot, awardAmount,
   setBlinds, buildPots, minRaiseTo, findBySocket, markDisconnected, reconnectPlayer,
-  isAbandoned, foldFor, serializeRoom,
+  isAbandoned, foldFor, setCardHandling, serializeRoom,
 } from './src/game.js';
+import { buildDeck, shuffle, maxSeatsForDeck } from './src/cards.js';
 
 let pass = 0, fail = 0;
 function check(label, cond) {
@@ -208,9 +209,10 @@ applyAction(mb, mbid.A, 'call');
 applyAction(mb, mbid.B, 'call');
 applyAction(mb, mbid.C, 'check');
 check('flop reached', mb.street === 'flop');
-check('minimum opening bet postflop is the big blind', minRaiseTo(mb) === 50);
+check('minimum opening bet postflop is the small blind', minRaiseTo(mb) === 25);
 check('a 1-chip bet is rejected postflop', !!applyAction(mb, mbid.B, 'raise', 1).error);
-check('betting the big blind is fine', applyAction(mb, mbid.B, 'raise', 50).ok === true);
+check('a bet under the small blind is rejected', !!applyAction(mb, mbid.B, 'raise', 20).error);
+check('betting the small blind is fine', applyAction(mb, mbid.B, 'raise', 25).ok === true);
 
 // Being short is always allowed — that is what going all-in means.
 const { room: sr, id: srid, who: srWho } = table('Alice', 'Bob');
@@ -535,6 +537,121 @@ awardAmount(msp, mspid.A, 200, 1);
 check('both pots settled ends the hand', msp.phase === 'lobby');
 check('chips conserved across side pots',
   msp.players.reduce((sum, p) => sum + p.stack, 0) === 600);
+
+// ---- The deck --------------------------------------------------------------
+const deck = buildDeck();
+check('a deck has 52 cards', deck.length === 52);
+check('every card is unique', new Set(deck).size === 52);
+check('shuffling keeps the same 52 cards',
+  new Set(shuffle(buildDeck())).size === 52);
+check('two shuffles do not match', shuffle(buildDeck()).join('') !== shuffle(buildDeck()).join(''));
+check('a deck seats 22 players', maxSeatsForDeck() === 22);
+
+// ---- Card handling is opt-in, and locked after the first hand ---------------
+const { room: cd, id: cdid, who: cdWho } = table('Alice', 'Bob', 'Cara');
+cd.players.forEach((p) => { p.stack = 1000; });
+
+check('rooms track chips only by default', cd.useCards === false);
+check('the host can turn dealing on', setCardHandling(cd, true).ok === true);
+check('the setting sticks', cd.useCards === true);
+check('and can be turned back off', setCardHandling(cd, false).ok === true && cd.useCards === false);
+setCardHandling(cd, true);
+
+startHand(cd);
+check('each player is dealt two cards', cd.players.every((p) => p.holeCards.length === 2));
+check('nobody shares a card',
+  new Set(cd.players.flatMap((p) => p.holeCards)).size === 6);
+check('the deck shrinks by what was dealt', cd.deck.length === 46);
+check('no community cards preflop', cd.communityCards.length === 0);
+check('the choice is locked once a hand has run', !!setCardHandling(cd, false).error);
+check('locking it out leaves the setting alone', cd.useCards === true);
+
+// Hole cards are private until showdown.
+const asBob = serializeRoom(cd, cdid.B);
+const bobsSeat = asBob.players.find((p) => p.id === cdid.B);
+const alicesSeat = asBob.players.find((p) => p.id === cdid.A);
+check('you can see your own cards', bobsSeat.holeCards?.length === 2);
+check('you cannot see anyone else��s', alicesSeat.holeCards === null);
+check('but you can see they hold cards', alicesSeat.cardCount === 2);
+check('a viewerless snapshot exposes nothing',
+  serializeRoom(cd).players.every((p) => p.holeCards === null));
+
+// The board arrives street by street, with a burn before each.
+applyAction(cd, cdid.A, 'call');
+applyAction(cd, cdid.B, 'call');
+applyAction(cd, cdid.C, 'check');
+check('the flop is three cards', cd.street === 'flop' && cd.communityCards.length === 3);
+check('one card was burned before the flop', cd.burnedCards.length === 1);
+check('the deck is down by the burn and the flop', cd.deck.length === 42);
+
+checkDownOneStreet(cd);
+check('the turn adds one', cd.street === 'turn' && cd.communityCards.length === 4);
+checkDownOneStreet(cd);
+check('the river adds one more', cd.street === 'river' && cd.communityCards.length === 5);
+check('three cards burned across the board', cd.burnedCards.length === 3);
+check('no card appears twice anywhere',
+  new Set([...cd.communityCards, ...cd.burnedCards, ...cd.players.flatMap((p) => p.holeCards), ...cd.deck]).size === 52);
+
+checkDown(cd);
+check('the hand reaches showdown', cd.phase === 'handComplete');
+const atShowdown = serializeRoom(cd, cdid.B);
+check('live hands are turned face up at showdown',
+  atShowdown.players.filter((p) => p.inHand).every((p) => p.holeCards?.length === 2));
+
+awardPot(cd, [cdid.A]);
+check('cards are cleared back in the lobby',
+  cd.communityCards.length === 0 && cd.players.every((p) => p.holeCards.length === 0));
+
+// ---- A folded hand is never exposed ----------------------------------------
+const { room: fh, id: fhid } = table('Alice', 'Bob', 'Cara');
+fh.players.forEach((p) => { p.stack = 1000; });
+setCardHandling(fh, true);
+startHand(fh);
+applyAction(fh, fhid.A, 'fold');
+applyAction(fh, fhid.B, 'call');  // small blind tops up to the big blind
+applyAction(fh, fhid.C, 'check'); // big blind takes its option
+checkDown(fh);
+check('the hand finished', fh.phase === 'handComplete');
+const afterFold = serializeRoom(fh, fhid.B);
+check('a folded hand stays face down',
+  afterFold.players.find((p) => p.id === fhid.A).holeCards === null);
+check('the players who saw it through are shown',
+  afterFold.players.find((p) => p.id === fhid.B).holeCards?.length === 2);
+
+// ---- An all-in showdown still gets the whole board -------------------------
+const { room: ro, id: roid, who: roWho } = table('Alice', 'Bob');
+ro.smallBlind = 0; ro.bigBlind = 0;
+roWho('A').stack = 100;
+roWho('B').stack = 100;
+setCardHandling(ro, true);
+startHand(ro);
+applyAction(ro, roid.A, 'allin');
+applyAction(ro, roid.B, 'call');
+check('betting ended on preflop', ro.phase === 'handComplete');
+check('the board still ran out', ro.communityCards.length === 5);
+check('the street reflects the finished board', ro.street === 'river');
+
+// A hand everyone folds out of never reaches a showdown, so no board is dealt.
+const { room: nb, id: nbid } = table('Alice', 'Bob', 'Cara');
+nb.players.forEach((p) => { p.stack = 1000; });
+setCardHandling(nb, true);
+startHand(nb);
+applyAction(nb, nbid.A, 'fold');
+applyAction(nb, nbid.B, 'fold');
+check('folding out settles with no board', nb.phase === 'lobby');
+
+// ---- Chip-only rooms are untouched by any of this --------------------------
+const { room: nc, id: ncid } = table('Alice', 'Bob', 'Cara');
+nc.players.forEach((p) => { p.stack = 1000; });
+startHand(nc);
+check('no cards are dealt when the room tracks chips only',
+  nc.players.every((p) => p.holeCards.length === 0));
+check('no board either', nc.communityCards.length === 0);
+check('and the deck stays empty', nc.deck.length === 0);
+applyAction(nc, ncid.A, 'call');
+applyAction(nc, ncid.B, 'call');
+applyAction(nc, ncid.C, 'check');
+check('streets still advance normally', nc.street === 'flop');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -19,7 +19,8 @@ Poker-App/
 ├── server/          # Express + Socket.io backend
 │   ├── src/
 │   │   ├── index.js # Socket.io wiring + HTTP health checks
-│   │   └── game.js  # in-memory rooms + betting engine
+│   │   ├── game.js  # in-memory rooms + betting engine
+│   │   └── cards.js # deck building and shuffling
 │   └── test-game.mjs
 ├── client/          # React + Vite frontend
 │   ├── src/
@@ -30,6 +31,7 @@ Poker-App/
 │   │       ├── Room.jsx
 │   │       ├── TableView.jsx
 │   │       ├── ActionBar.jsx
+│   │       ├── Card.jsx
 │   │       └── HostControls.jsx
 │   └── e2e-test.mjs
 ├── render.yaml      # backend deploy blueprint (Render)
@@ -132,6 +134,31 @@ The **host** gets a second screen (a `Table`/`Host` toggle) for running the
 game: stacks, blinds, starting hands, and awarding pots. The action bar stays
 visible on both, so being on the host screen can never cost the host a turn — and
 each tab shows a dot when it needs attention.
+
+## Cards (optional)
+
+By default the app tracks chips only and you deal a real deck. Before the
+**first** hand, the host can switch the room to **Deal in app** — after that the
+choice is locked, since changing it mid-game would change what a hand means
+partway through.
+
+With dealing on:
+
+- Each player gets two hole cards, dealt one at a time starting left of the
+  button, from a deck shuffled with the crypto RNG (not `Math.random`).
+- One card is **burned** before the flop, turn, and river, as at a real table.
+- If betting ends early because everyone is all-in, the **board still runs out**
+  so the showdown can be read. A hand everyone folds out of never gets there,
+  so no board is dealt.
+
+**Hole cards are private.** State is serialized *per viewer* and broadcast to
+each socket individually rather than to the room, so a player's cards only ever
+reach them. At showdown the hands still in play are turned face up for everyone;
+**a hand that folded is never exposed**. Other seats show a face-down count so
+you can see who holds cards without seeing them.
+
+The app does **not** rank hands — it deals and reveals, and the host awards the
+pot as they do for a physical deck.
 
 ## Dropped connections
 

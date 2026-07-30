@@ -1,6 +1,7 @@
 // In-memory game state and betting logic
 
 import { randomUUID } from 'node:crypto';
+import { buildDeck, shuffle, CARDS_PER_PLAYER, maxSeatsForDeck } from './cards.js';
 
 const rooms = new Map();
 
@@ -60,8 +61,15 @@ function createRoom(hostSocketId, hostName) {
     bigBlind: 50,
     lastRaiseSize: 50,
     pots: [],
-    lastHandSummary: null, // [{ playerId, name, amount }] 
+    lastHandSummary: null, // [{ playerId, name, amount }]
     street: null, // 'preflop' | 'flop' | 'turn' | 'river' while a hand is live
+    // Optional in-app dealing. Off by default — the app is a chip tracker for
+    // a game played with real cards unless the host says otherwise, and the
+    // choice is locked once the first hand is dealt.
+    useCards: false,
+    deck: [],
+    communityCards: [],
+    burnedCards: [],
   };
   rooms.set(code, room);
 
@@ -88,6 +96,7 @@ function addPlayer(room, socketId, name, startingStack, isHost = false) {
     isAllIn: false,
     hasActed: false,
     connected: true,
+    holeCards: [], // only ever sent to their owner, until showdown
   };
   room.players.push(player);
   return player;
@@ -184,11 +193,68 @@ function commitChips(room, player, amount) {
 
 const STREETS = ['preflop', 'flop', 'turn', 'river'];
 
+// ---- Dealing (only when the host has turned cards on) -----------------------
+
+const COMMUNITY_COUNT = { flop: 3, turn: 1, river: 1 };
+
+// The host opts in before the first hand and is then locked out — switching
+// mid-session would change what a hand means partway through a game.
+function setCardHandling(room, enabled) {
+  if (room.phase !== 'lobby') {
+    return { error: 'Cannot change card dealing mid-hand.' };
+  }
+  if (room.handNumber > 0) {
+    return { error: 'Card dealing can only be set before the first hand.' };
+  }
+  const want = Boolean(enabled);
+  if (want && room.players.length > maxSeatsForDeck()) {
+    return { error: `A single deck seats at most ${maxSeatsForDeck()} players.` };
+  }
+  room.useCards = want;
+  return { ok: true };
+}
+
+// Two cards each, one at a time, starting left of the button — the order a
+// real dealer uses.
+function dealHoleCards(room) {
+  const dealerIdx = room.players.findIndex((p) => p.id === room.dealerId);
+  const n = room.players.length;
+  const receivers = [];
+  for (let step = 1; step <= n; step++) {
+    const p = room.players[(dealerIdx + step) % n];
+    if (p.inHand) receivers.push(p);
+  }
+  for (let round = 0; round < CARDS_PER_PLAYER; round++) {
+    for (const p of receivers) p.holeCards.push(room.deck.pop());
+  }
+}
+
+// Burn one, then turn the street's cards, as at a real table.
+function dealStreet(room, street) {
+  if (!room.useCards) return;
+  const count = COMMUNITY_COUNT[street];
+  if (!count) return;
+  room.burnedCards.push(room.deck.pop());
+  for (let i = 0; i < count; i++) room.communityCards.push(room.deck.pop());
+}
+
+// Betting can end before the board is complete — everyone all-in, say. A real
+// showdown still needs the rest of the board turned so the winner can be read.
+function runOutBoard(room) {
+  let next = STREETS[STREETS.indexOf(room.street) + 1];
+  while (next) {
+    dealStreet(room, next);
+    room.street = next;
+    next = STREETS[STREETS.indexOf(next) + 1];
+  }
+}
+
 // Open a new betting round. Bets from the previous street are already in the
 // pot, so what resets is the per-round state: what each player owes, and
 // whether they have acted yet
 function startStreet(room, street) {
   room.street = street;
+  dealStreet(room, street);
   room.highestBet = 0;
   room.lastRaiseSize = room.smallBlind; // a fresh street opens at the small blind
   for (const p of room.players) {
@@ -258,7 +324,12 @@ function startHand(room) {
     p.hasActed = false;
     p.isAllIn = false;
     p.inHand = p.stack > 0; // players with no chips sit out
+    p.holeCards = [];
   }
+
+  room.communityCards = [];
+  room.burnedCards = [];
+  room.deck = room.useCards ? shuffle(buildDeck()) : [];
 
   const inHand = (p) => p.inHand;
   const canAct = (p) => p.inHand && !p.isAllIn;
@@ -277,6 +348,9 @@ function startHand(room) {
   const bbIdx = nextIndex(room, sbIdx, inHand);
   room.smallBlindId = room.players[sbIdx].id;
   room.bigBlindId = room.players[bbIdx].id;
+
+  // Cards go out once the button is seated, since dealing starts to its left.
+  if (room.useCards) dealHoleCards(room);
 
   commitChips(room, room.players[sbIdx], room.smallBlind);
   commitChips(room, room.players[bbIdx], room.bigBlind);
@@ -445,6 +519,9 @@ function recordPayout(room, player, amount) {
 function completeHand(room) {
   room.phase = 'handComplete';
   room.turnIndex = -1;
+  // A contested showdown needs the whole board, even when the betting stopped
+  // early. A hand everyone folded out of never gets there.
+  if (room.useCards && activePlayers(room).length > 1) runOutBoard(room);
   room.pots = buildPots(room);
 
   // A pot with a single eligible player has nothing to decide — an uncalled
@@ -468,12 +545,16 @@ function settleIfDone(room) {
   // belong to the hand that just ended.
   room.smallBlindId = null;
   room.bigBlindId = null;
+  room.communityCards = [];
+  room.burnedCards = [];
+  room.deck = [];
   for (const p of room.players) {
     p.currentBet = 0;
     p.committed = 0;
     p.hasActed = false;
     p.isAllIn = false;
     p.inHand = false;
+    p.holeCards = [];
   }
   return true;
 }
@@ -660,8 +741,12 @@ function setBlinds(room, smallBlind, bigBlind) {
   return { ok: true };
 }
 
-// The public snapshot broadcast to every client after each change.
-function serializeRoom(room) {
+// The snapshot sent to a client after each change. It is built *per viewer*
+// because hole cards are private: `viewerId` gets their own cards, and at
+// showdown everyone sees the cards of players still in the hand. A hand that
+// folded is never exposed. Pass no viewer for a strictly public view.
+function serializeRoom(room, viewerId = null) {
+  const showdown = room.phase === 'handComplete';
   return {
     code: room.code,
     hostId: room.hostId,
@@ -688,18 +773,27 @@ function serializeRoom(room) {
     })),
     lastHandSummary: room.lastHandSummary ? room.lastHandSummary.map((e) => ({ ...e })) : null,
     currentTurnId: room.turnIndex >= 0 ? room.players[room.turnIndex]?.id ?? null : null,
-    players: room.players.map((p) => ({
-      id: p.id,
-      name: p.name,
-      stack: p.stack,
-      currentBet: p.currentBet,
-      committed: p.committed,
-      isHost: p.isHost,
-      inHand: p.inHand,
-      isAllIn: p.isAllIn,
-      hasActed: p.hasActed,
-      connected: p.connected,
-    })),
+    useCards: room.useCards,
+    communityCards: [...room.communityCards],
+    players: room.players.map((p) => {
+      // Your own cards are always yours to see. At showdown the hands still in
+      // play are turned face up; everything else stays face down.
+      const visible = (viewerId !== null && p.id === viewerId) || (showdown && p.inHand);
+      return {
+        id: p.id,
+        name: p.name,
+        stack: p.stack,
+        currentBet: p.currentBet,
+        committed: p.committed,
+        isHost: p.isHost,
+        inHand: p.inHand,
+        isAllIn: p.isAllIn,
+        hasActed: p.hasActed,
+        connected: p.connected,
+        cardCount: p.holeCards.length,
+        holeCards: visible ? [...p.holeCards] : null,
+      };
+    }),
   };
 }
 
@@ -714,6 +808,7 @@ export {
   awardPot,
   awardAmount,
   setBlinds,
+  setCardHandling,
   buildPots,
   minRaiseTo,
   findBySocket,

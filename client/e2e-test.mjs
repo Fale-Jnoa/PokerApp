@@ -207,6 +207,58 @@ await emit(p3b, 'room:leave', {});
 state = await statePromise;
 check('leaving removes the player', !state.players.some((p) => p.name === 'Cara'));
 
+// ---- Card handling over the wire -------------------------------------------
+// Fresh room: the setting is locked after the first hand in the one above.
+const cHost = io(URL, { transports: ['websocket'] });
+const cP2 = io(URL, { transports: ['websocket'] });
+await Promise.all([cHost, cP2].map((s) => new Promise((r) => s.on('connect', r))));
+
+const cRoom = await emit(cHost, 'room:create', { name: 'Dealer' });
+const cCode = cRoom.code;
+const cJoin = await emit(cP2, 'room:join', { code: cCode, name: 'Player' });
+check('room defaults to chips only', cRoom.state.useCards === false);
+check('non-host cannot turn dealing on',
+  (await emit(cP2, 'room:setCardHandling', { code: cCode, enabled: true })).error);
+
+const cardsOn = stateWhere(cHost, (st) => st.useCards === true);
+await emit(cHost, 'room:setCardHandling', { code: cCode, enabled: true });
+await cardsOn;
+
+for (const pid of [cRoom.playerId, cJoin.playerId]) {
+  await emit(cHost, 'room:setStack', { code: cCode, playerId: pid, stack: 1000 });
+}
+
+// Each player's own snapshot must carry their cards and nobody else's.
+const hostDealt = stateWhere(cHost, (st) => st.phase === 'betting');
+const p2Dealt = stateWhere(cP2, (st) => st.phase === 'betting');
+await emit(cHost, 'game:startHand', { code: cCode });
+const [hostView, p2View] = await Promise.all([hostDealt, p2Dealt]);
+
+const hostSelf = hostView.players.find((p) => p.id === cRoom.playerId);
+const hostSeesOther = hostView.players.find((p) => p.id === cJoin.playerId);
+check('the host is dealt two cards', hostSelf.holeCards?.length === 2);
+check('the host cannot see the other hand', hostSeesOther.holeCards === null);
+check('but knows it holds two cards', hostSeesOther.cardCount === 2);
+
+const p2Self = p2View.players.find((p) => p.id === cJoin.playerId);
+const p2SeesHost = p2View.players.find((p) => p.id === cRoom.playerId);
+check('the other player sees their own cards', p2Self.holeCards?.length === 2);
+check('and cannot see the host hand', p2SeesHost.holeCards === null);
+check('the two hands are actually different',
+  p2Self.holeCards.join('') !== hostSelf.holeCards.join(''));
+check('the setting is locked once a hand has run',
+  (await emit(cHost, 'room:setCardHandling', { code: cCode, enabled: false })).error);
+
+// Play it out heads-up and confirm the board and the showdown reveal.
+const showdown = stateWhere(cHost, (st) => st.phase === 'handComplete');
+await emit(cHost, 'game:action', { code: cCode, action: 'allin' });
+await emit(cP2, 'game:action', { code: cCode, action: 'call' });
+const shown = await showdown;
+check('the board ran out to five cards', shown.communityCards.length === 5);
+check('both hands are face up at showdown',
+  shown.players.every((p) => p.holeCards?.length === 2));
+
+cHost.close(); cP2.close();
 host.close(); p2.close(); p3b.close();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

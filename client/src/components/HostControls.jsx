@@ -11,6 +11,7 @@ export default function HostControls({ room, emit }) {
 
       {room.phase !== 'betting' && (
         <>
+          <CardHandling room={room} emit={emit} />
           <BlindSetter room={room} emit={emit} />
           <StackAssigner room={room} emit={emit} />
         </>
@@ -40,6 +41,45 @@ export default function HostControls({ room, emit }) {
       )}
 
       {room.phase === 'betting' && <StalledTurn room={room} emit={emit} />}
+    </div>
+  );
+}
+
+// Whether the app deals. Settled before the first hand and locked after, so a
+// game can't change what a hand means halfway through.
+function CardHandling({ room, emit }) {
+  const locked = room.handNumber > 0;
+
+  if (locked) {
+    return (
+      <p className="hint card-mode is-locked">
+        {room.useCards
+          ? 'Dealing cards in-app for this game.'
+          : 'Playing with real cards — the app tracks chips only.'}
+      </p>
+    );
+  }
+
+  return (
+    <div className="card-mode">
+      <p className="hint">
+        Deal cards in the app, or keep using a real deck? This is fixed once the
+        first hand starts.
+      </p>
+      <div className="view-toggle wide-toggle">
+        <button
+          className={!room.useCards ? 'active' : ''}
+          onClick={() => emit('room:setCardHandling', { enabled: false })}
+        >
+          Real cards
+        </button>
+        <button
+          className={room.useCards ? 'active' : ''}
+          onClick={() => emit('room:setCardHandling', { enabled: true })}
+        >
+          Deal in app
+        </button>
+      </div>
     </div>
   );
 }

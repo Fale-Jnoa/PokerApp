@@ -1,3 +1,5 @@
+import { CardRow } from './Card.jsx';
+
 // Table View: an overhead felt table with every player seated around the rail.
 // Seats are laid out on an ellipse and rotated so the viewer always sits at the
 // bottom, the way an online poker client does it.
@@ -34,6 +36,9 @@ export default function TableView({ room, playerId }) {
           <div className="felt-inner" />
 
           <div className="felt-center">
+            {room.useCards && room.communityCards.length > 0 && (
+              <CardRow cards={room.communityCards} size="md" className="board" />
+            )}
             <div className="pot-label">TOTAL POT</div>
             <div className="pot-amount">{room.pot}</div>
             {room.phase === 'betting' && room.highestBet > 0 && (
@@ -65,6 +70,14 @@ export default function TableView({ room, playerId }) {
                   ].join(' ')}
                   style={ellipsePoint(angle, SEAT_RX, SEAT_RY)}
                 >
+                  {p.cardCount > 0 && (
+                    <CardRow
+                      cards={p.holeCards}
+                      count={p.cardCount}
+                      size="sm"
+                      className="seat-cards"
+                    />
+                  )}
                   <div className="seat-avatar">
                     {initials(p.name)}
                     {!p.connected && <span className="seat-offline" title="offline" />}

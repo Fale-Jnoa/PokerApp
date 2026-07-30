@@ -12,6 +12,7 @@ import {
   awardPot,
   awardAmount,
   setBlinds,
+  setCardHandling,
   foldFor,
   findBySocket,
   markDisconnected,
@@ -45,8 +46,12 @@ const io = new Server(server, {
 // Track which room each socket belongs to, for clean disconnect handling.
 const socketRoom = new Map(); // socketId -> roomCode
 
+// Sent per socket rather than to the room, because each player's snapshot
+// contains their own hole cards and nobody else's.
 function broadcast(room) {
-  io.to(room.code).emit('room:state', serializeRoom(room));
+  for (const p of room.players) {
+    if (p.socketId) io.to(p.socketId).emit('room:state', serializeRoom(room, p.id));
+  }
 }
 
 // Resolve the acting player from the connection. Player ids are no longer
@@ -87,7 +92,7 @@ io.on('connection', (socket) => {
       code: room.code,
       playerId: host.id,
       token: host.token,
-      state: serializeRoom(room),
+      state: serializeRoom(room, host.id),
     });
     broadcast(room);
   });
@@ -110,7 +115,7 @@ io.on('connection', (socket) => {
       code: room.code,
       playerId: player.id,
       token: player.token,
-      state: serializeRoom(room),
+      state: serializeRoom(room, player.id),
     });
     broadcast(room);
   });
@@ -128,7 +133,7 @@ io.on('connection', (socket) => {
       code: room.code,
       playerId: result.player.id,
       token: result.player.token,
-      state: serializeRoom(room),
+      state: serializeRoom(room, result.player.id),
     });
     broadcast(room);
   });
@@ -152,6 +157,16 @@ io.on('connection', (socket) => {
     const { room, error } = hostActor(socket);
     if (error) return ack?.({ error });
     const result = setBlinds(room, smallBlind, bigBlind);
+    if (result.error) return ack?.(result);
+    ack?.({ ok: true });
+    broadcast(room);
+  });
+
+  // Host decides whether the app deals cards. Locked once the first hand runs.
+  socket.on('room:setCardHandling', ({ enabled }, ack) => {
+    const { room, error } = hostActor(socket);
+    if (error) return ack?.({ error });
+    const result = setCardHandling(room, enabled);
     if (result.error) return ack?.(result);
     ack?.({ ok: true });
     broadcast(room);
